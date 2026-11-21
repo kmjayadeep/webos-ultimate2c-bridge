@@ -8,10 +8,10 @@ Without it, the TV detects the receiver but the controller never sends any input
 
 | TV | webOS | Kernel | Result |
 |---|---|---|---|
-| LG OLED55B49LA | 10.3.1 | 5.4.268-294.24.papikonda.2 (aarch64) | Working, including several controllers at once |
+| LG OLED55B49LA | 10.3.1 | 5.4.268-294.24.papikonda.2 (aarch64) | Working, including several controllers at once and Moonlight |
 | LG 55UR7500PSC | 10.3.2 (firmware 33.31.75) | 5.4.268 | Working with one controller: D-pad navigation on the Home screen |
 
-Both TVs are rooted with the Homebrew Channel. Not checked yet: Moonlight, and behaviour after sleep and wake. If you test another model, a PR adding a row is welcome.
+Both TVs are rooted with the Homebrew Channel. Not checked yet: behaviour after sleep and wake. If you test another model, a PR adding a row is welcome.
 
 ## Install
 
