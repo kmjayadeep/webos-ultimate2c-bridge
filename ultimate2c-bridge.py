@@ -12,13 +12,17 @@ driver would have produced, so webOS (libim) and apps treat it as a normal pad.
 A rumble packet (00 08 ...) silences the receiver again, so no rumble is sent and
 the uinput device does not advertise force feedback.
 
+Each receiver pairs with one controller. Up to MAX_PLAYERS receivers are served at once,
+each in its own thread with its own uinput pad and player LED (lowest free slot first).
+
 Run as root. Stops cleanly on SIGTERM/SIGINT and hands the interface back to xpad.
 """
-import os, sys, time, struct, ctypes, fcntl, errno, signal, glob
+import os, sys, time, struct, ctypes, fcntl, errno, signal, glob, threading
 
 VID, PID = 0x2dc8, 0x310a
 EP_IN, EP_OUT = 0x84, 0x05
 LED_PACKET = b"\x01\x03\x02"          # Xbox 360 "set LED" (player 1 blink/solid)
+MAX_PLAYERS = 4                        # the Xbox 360 LED protocol has four player slots
 HANDSHAKE_RETRY_S = 10.0               # until the first report: repeat the handshake this often
 SILENCE_RETRY_S = 60.0                 # after reports have been seen: repeat only after this much silence
 LOG = "/tmp/ultimate2c-bridge.log"
@@ -47,23 +51,35 @@ AXES = [(ABS_X, -32768, 32767, 16, 128), (ABS_Y, -32768, 32767, 16, 128), (ABS_R
 EVENT_FMT = "llHHi"
 
 running = True
+_log_lock = threading.Lock()
 def log(msg):
     line = "%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), msg)
-    sys.stdout.write(line); sys.stdout.flush()
-    try:
-        if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000: os.replace(LOG, LOG + ".old")
-        with open(LOG, "a") as f: f.write(line)
-    except OSError: pass
-
-def find_receiver():
-    for d in glob.glob("/sys/bus/usb/devices/*"):
+    with _log_lock:
+        sys.stdout.write(line); sys.stdout.flush()
         try:
-            if int(open(d + "/idVendor").read(), 16) != VID or int(open(d + "/idProduct").read(), 16) != PID: continue
+            if os.path.exists(LOG) and os.path.getsize(LOG) > 200_000: os.replace(LOG, LOG + ".old")
+            with open(LOG, "a") as f: f.write(line)
+        except OSError: pass
+
+def led_packet(player):
+    """Xbox 360 set-LED packet: pattern 2..5 = "blink, then light player 1..4"."""
+    if not 1 <= player <= MAX_PLAYERS: raise ValueError("player must be 1..%d, got %r" % (MAX_PLAYERS, player))
+    return bytes([0x01, 0x03, 0x01 + player])
+
+def _read(path):
+    with open(path) as f: return f.read()
+
+def find_receivers():
+    """All receivers in XInput mode as (syspath, busnum, devnum), sorted by syspath."""
+    found = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            if int(_read(d + "/idVendor"), 16) != VID or int(_read(d + "/idProduct"), 16) != PID: continue
             intf = d + "/" + os.path.basename(d) + ":1.0"
-            if open(intf + "/bInterfaceClass").read().strip() != "ff" or open(intf + "/bInterfaceSubClass").read().strip() != "5d": continue
-            return d, int(open(d + "/busnum").read()), int(open(d + "/devnum").read())
+            if _read(intf + "/bInterfaceClass").strip() != "ff" or _read(intf + "/bInterfaceSubClass").strip() != "5d": continue
+            found.append((d, int(_read(d + "/busnum")), int(_read(d + "/devnum"))))
         except (OSError, ValueError): continue
-    return None
+    return found
 
 class Uinput:
     def __init__(self, vendor, product, version):
@@ -104,7 +120,8 @@ def parse_report(r):
     return s
 
 class Receiver:
-    def __init__(self, bus, dev):
+    def __init__(self, bus, dev, player=1):
+        self.led = led_packet(player)
         self.fd = os.open("/dev/bus/usb/%03d/%03d" % (bus, dev), os.O_RDWR)
         self.claimed = False
     def driver_ioctl(self, code):
@@ -130,7 +147,7 @@ class Receiver:
         for value, length in ((0x0100, 20), (0x0000, 4)):
             try: self.control(0xC1, 0x01, value, 0x0000, length)
             except OSError as e: log("capability request %#06x failed: %s" % (value, e))
-        try: self.xfer(EP_OUT, LED_PACKET, timeout=500); return True
+        try: self.xfer(EP_OUT, self.led, timeout=500); return True
         except OSError as e: log("LED packet failed: %s" % e); return False
     def close(self):
         if self.claimed:
@@ -139,13 +156,13 @@ class Receiver:
             self.driver_ioctl(USBDEVFS_CONNECT)       # give the interface back to xpad
         os.close(self.fd)
 
-def serve(syspath, bus, dev):
-    version = int(open(syspath + "/bcdDevice").read(), 16)
-    rx = Receiver(bus, dev); ui = None
+def serve(syspath, bus, dev, player=1):
+    version = int(_read(syspath + "/bcdDevice"), 16)
+    rx = Receiver(bus, dev, player); ui = None
     try:
-        ui = Uinput(VID, PID, version); log("uinput device created: %r" % UINPUT_NAME)
+        ui = Uinput(VID, PID, version); log("uinput device created: %r (player %d)" % (UINPUT_NAME, player))
         time.sleep(0.5)                                   # let the compositor pick up the new node first
-        rx.claim(); log("claimed %s (bus %d dev %d); xpad detached" % (os.path.basename(syspath), bus, dev))
+        rx.claim(); log("claimed %s (bus %d dev %d) as player %d; xpad detached" % (os.path.basename(syspath), bus, dev, player))
         rx.handshake(); last_led = time.time(); last_report = 0.0; reports = 0; events = 0; tick = time.time()
         while running:
             try: r = rx.xfer(EP_IN, length=32, timeout=500)
@@ -172,15 +189,30 @@ def main():
     def stop(signum, frame):
         global running; running = False
     signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
-    log("bridge starting (pid %d), waiting for %04x:%04x" % (os.getpid(), VID, PID))
+    log("bridge starting (pid %d), waiting for %04x:%04x (up to %d)" % (os.getpid(), VID, PID, MAX_PLAYERS))
+
+    def run(key, player):
+        try: serve(*key, player=player)
+        except OSError as e: log("serve failed for %s: %s" % (os.path.basename(key[0]), e))
+
+    workers = {}      # (syspath, bus, dev) -> (thread, player)
+    finished = set()  # instances whose serve() returned; not served again until they re-enumerate
+    waiting = set()   # instances already logged as waiting for a free player slot
     while running:
-        found = find_receiver()
-        if not found: time.sleep(1.0); continue
-        syspath, bus, dev = found
-        try: serve(syspath, bus, dev)
-        except OSError as e: log("serve failed: %s" % e)
-        # wait until this device instance disappears (re-enumeration gives a new devnum)
-        while running and find_receiver() == found: time.sleep(1.0)
+        present = set(find_receivers())
+        for key, (t, _) in list(workers.items()):
+            if not t.is_alive(): del workers[key]; finished.add(key)
+        finished &= present; waiting &= present
+        for key in sorted(present - finished - set(workers)):
+            free = sorted(set(range(1, MAX_PLAYERS + 1)) - {p for _, p in workers.values()})
+            if not free:
+                if key not in waiting: log("%s waiting: all %d player slots in use" % (os.path.basename(key[0]), MAX_PLAYERS)); waiting.add(key)
+                continue
+            waiting.discard(key)
+            t = threading.Thread(target=run, args=(key, free[0]), name="serve-%s" % os.path.basename(key[0]), daemon=True)
+            workers[key] = (t, free[0]); t.start()
+        time.sleep(1.0)
+    for t, _ in workers.values(): t.join()
     log("bridge stopped")
 
 if __name__ == "__main__": main()

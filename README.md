@@ -21,15 +21,19 @@ Observed on the receiver's XInput interface:
 
 ## The fix
 
-`ultimate2c-bridge.py` is a small root daemon that replaces `xpad` for this one device:
+`ultimate2c-bridge.py` is a small root daemon that replaces `xpad` for this device. For each receiver it finds:
 
 1. Waits for `2dc8:310a` to appear in `/sys/bus/usb/devices`.
 2. Creates a uinput pad named "Generic X-Box pad" (bus USB, `2dc8:310a`) with the same buttons, axes and ranges `xpad` would create.
-3. Detaches `xpad` from interface 0 via usbfs, claims it, sends the XInput capability requests and the LED packet.
+3. Detaches `xpad` from interface 0 via usbfs, claims it, sends the XInput capability requests and the LED packet for its player number.
 4. Parses the XInput reports with the `xpad` mapping and writes only changed values to uinput.
 5. Repeats the handshake every 10 s until the first report, then only after 60 s of silence. When the receiver disappears or goes to its "8BitDo IDLE" state it hands the interface back to `xpad` and waits again.
 
 No force feedback is advertised, because a rumble packet silences the receiver. CPU use is negligible. Log: `/tmp/ultimate2c-bridge.log`.
+
+### Multiple controllers
+
+Each receiver pairs with one controller, so plug in one receiver per controller. Up to four receivers are served at once. Each runs in its own thread with its own pad, and gets the lowest free player number (LED packet `01 03 02` to `01 03 05`). A fifth receiver waits until one is unplugged. Unplugging one receiver doesn't affect the others. Only player 1's LED packet has been confirmed on hardware, and a second receiver hasn't been tested.
 
 ## Requirements
 
